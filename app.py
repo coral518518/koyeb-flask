@@ -625,35 +625,50 @@ def start_task():
 
     return ({"msg": "后台任务已启动"})
 
+def get_env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def get_env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[Warn] 环境变量 {name} 不是合法整数，使用默认值 {default}")
+        return default
+    
 def main() -> None:
     try:
         global running
-        print("Hello, world!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!") 
-        parser = argparse.ArgumentParser(description="AI 自动注册脚本")
-        parser.add_argument(
-            "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
-        )
-        parser.add_argument("--once", action="store_true", help="只运行一次")
-        parser.add_argument("--sleep-min", type=int, default=300, help="循环模式最短等待秒数")
-        parser.add_argument(
-            "--sleep-max", type=int, default=500, help="循环模式最长等待秒数"
-        )
-        args = parser.parse_args()
 
-        sleep_min = max(1, args.sleep_min)
-        sleep_max = max(sleep_min, args.sleep_max)
+        print("Hello, world!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+        # 从环境变量读取配置
+        proxy = os.environ.get("PROXY", None)
+        once = get_env_bool("ONCE", False)
+        sleep_min = max(1, get_env_int("SLEEP_MIN", 300))
+        sleep_max = max(sleep_min, get_env_int("SLEEP_MAX", 500))
 
         count = 0
         print("[Info] Yasal's Seamless AI Auto-Registrar Started for ZJH")
+        print(f"[Info] PROXY={proxy}")
+        print(f"[Info] ONCE={once}")
+        print(f"[Info] SLEEP_MIN={sleep_min}")
+        print(f"[Info] SLEEP_MAX={sleep_max}")
+
+        # 确保 json 目录存在
+        os.makedirs("json", exist_ok=True)
 
         while True:
             count += 1
-            print(
-                f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<"
-            )
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<")
 
             try:
-                token_json = run(args.proxy)
+                token_json = run(proxy)
 
                 if token_json:
                     try:
@@ -663,9 +678,8 @@ def main() -> None:
                         fname_email = "unknown"
 
                     file_name = f"token_{fname_email}_{int(time.time())}.json"
-
                     file_path = os.path.join("json", file_name)
-                    
+
                     with open(file_path, "w", encoding="utf-8") as f:
                         f.write(token_json)
 
@@ -676,20 +690,23 @@ def main() -> None:
             except Exception as e:
                 print(f"[Error] 发生未捕获异常: {e}")
 
-            if running == False:
+            if running is False:
+                print("[Info] running=False，程序退出。")
                 break
 
-            if args.once:
+            if once:
+                print("[Info] ONCE=true，只运行一次，程序退出。")
                 break
 
             wait_time = random.randint(sleep_min, sleep_max)
             print(f"[*] 休息 {wait_time} 秒...")
             time.sleep(wait_time)
+
         return None
+
     except Exception as e:
-        print(f"[Error] 发生未捕获异常: {e}")
+        print(f"[Error] main() 发生未捕获异常: {e}")
         return None
-    
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))  # 本地调试用默认端口
