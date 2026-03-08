@@ -12,6 +12,8 @@ import hashlib
 import base64
 import threading
 import argparse
+import zipfile
+import tempfile
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 from dataclasses import dataclass
@@ -24,10 +26,51 @@ from curl_cffi import requests
 
 app = Flask(__name__)
 
+FILE_DIR = "./json"
 
 @app.route("/")
 def hello_world():
     return "Hello from Koyebssssssss"
+
+@app.route("/download", methods=["GET"])
+def download_file():
+    filename = request.args.get("filename")
+
+    # 单个文件下载
+    if filename:
+        file_path = os.path.join(FILE_DIR, filename)
+
+        # 防止路径穿越攻击
+        if not os.path.abspath(file_path).startswith(os.path.abspath(FILE_DIR)):
+            abort(400, "非法文件名")
+
+        if not os.path.isfile(file_path):
+            abort(404, f"文件不存在: {filename}")
+
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=filename
+        )
+
+    # 不传 filename，打包全部文件下载
+    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    zip_path = temp_zip.name
+    temp_zip.close()
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(FILE_DIR):
+            for file in files:
+                full_path = os.path.join(root, file)
+                arcname = os.path.relpath(full_path, FILE_DIR)
+                zipf.write(full_path, arcname)
+
+    return send_file(
+        zip_path,
+        as_attachment=True,
+        download_name="all_files.zip",
+        mimetype="application/zip"
+    )
 
 # ==========================================
 # Mail.tm 临时邮箱 API
