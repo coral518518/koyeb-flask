@@ -22,6 +22,29 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from flask import Flask
+import os
+import re
+import sys
+import time
+import uuid
+import math
+import random
+import string
+import secrets
+import hashlib
+import base64
+import threading
+import argparse
+from faker import Faker
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, parse_qs, urlencode, quote
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List
+import urllib.parse
+import ssl
+import urllib.request
+import urllib.error
+
 from curl_cffi import requests
 
 app = Flask(__name__)
@@ -72,12 +95,70 @@ def download_file():
         mimetype="application/zip"
     )
 
+# 用来控制后台任务是否运行
+running = False
+worker_thread = None
+
+@app.route("/stop")
+def stop_task():
+    global running
+    running = False
+    return ({"msg": "后台任务已停止"})
+
+@app.route("/s")
+def start_task():
+    global running, worker_thread
+
+    if running:
+        return ({"msg": "任务已经在运行中"})
+
+    running = True
+    worker_thread = threading.Thread(target=main, daemon=True)
+    worker_thread.start()
+
+    return ({"msg": "后台任务已启动"})
+
+
 # ==========================================
-# Mail.tm 临时邮箱 API
+# Cloudflare Temp Email API
 # ==========================================
 
-MAILTM_BASE = "https://api.mail.tm"
 
+def _load_dotenv(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
+TOKEN_OUTPUT_DIR = os.getenv("TOKEN_OUTPUT_DIR", "").strip()
+MAILTM_BASE = "https://email.auf.us.ci"
+MAILTM_TOKEN = "tYAH4QHWdC54oTxohLsMhj1zJrkyzPoy37PHZjOzDD3"
+
+def _ssl_verify() -> bool:
+    flag = os.getenv("OPENAI_SSL_VERIFY", "1").strip().lower()
+    return flag not in {"0", "false", "no", "off"}
+
+
+def _skip_net_check() -> bool:
+    flag = os.getenv("SKIP_NET_CHECK", "0").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
 
 def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, Any]:
     headers = {"Accept": "application/json"}
@@ -87,13 +168,11 @@ def _mailtm_headers(*, token: str = "", use_json: bool = False) -> Dict[str, Any
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-
 def _mailtm_domains(proxies: Any = None) -> List[str]:
     resp = requests.get(
-        f"{MAILTM_BASE}/domains",
-        headers=_mailtm_headers(),
+        f"{MAILTM_BASE}/api/generate",
+        headers=_mailtm_headers(token=MAILTM_TOKEN),
         proxies=proxies,
-        impersonate="chrome",
         timeout=15,
     )
     if resp.status_code != 200:
@@ -101,27 +180,15 @@ def _mailtm_domains(proxies: Any = None) -> List[str]:
 
     data = resp.json()
     domains = []
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = data.get("hydra:member") or data.get("items") or []
-    else:
-        items = []
+    email = str(data.get("email") or "").strip()
 
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        domain = str(item.get("domain") or "").strip()
-        is_active = item.get("isActive", True)
-        is_private = item.get("isPrivate", False)
-        if domain and is_active and not is_private:
-            domains.append(domain)
+    domain = email
+    domains.append(domain)
 
     return domains
-
-
+    
 def get_email_and_token(proxies: Any = None) -> tuple:
-    """创建 Mail.tm 邮箱并获取 Bearer Token"""
+    """生成随机前缀的自有域名邮箱"""
     try:
         domains = _mailtm_domains(proxies)
         if not domains:
@@ -129,48 +196,41 @@ def get_email_and_token(proxies: Any = None) -> tuple:
             return "", ""
         domain = random.choice(domains)
 
-        for _ in range(5):
-            local = f"oc{secrets.token_hex(5)}"
-            email = f"{local}@{domain}"
-            password = secrets.token_urlsafe(18)
-            print(f"[*] 账号密码: {password}")
+        email = domain
 
-            create_resp = requests.post(
-                f"{MAILTM_BASE}/accounts",
-                headers=_mailtm_headers(use_json=True),
-                json={"address": email, "password": password},
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-
-            if create_resp.status_code not in (200, 201):
-                continue
-
-            token_resp = requests.post(
-                f"{MAILTM_BASE}/token",
-                headers=_mailtm_headers(use_json=True),
-                json={"address": email, "password": password},
-                proxies=proxies,
-                impersonate="chrome",
-                timeout=15,
-            )
-
-            if token_resp.status_code == 200:
-                token = str(token_resp.json().get("token") or "").strip()
-                if token:
-                    return email, token
-
-        print("[Error] Mail.tm 邮箱创建成功但获取 Token 失败")
-        return "", ""
+        print(f"email: {email}")
+        
+        token = MAILTM_TOKEN
+        return email, token
+ 
     except Exception as e:
         print(f"[Error] 请求 Mail.tm API 出错: {e}")
         return "", ""
 
 
+
+def _extract_otp_code(content: str) -> str:
+    if not content:
+        return ""
+    patterns = [
+        r"Your ChatGPT code is\s*(\d{6})",
+        r"ChatGPT code is\s*(\d{6})",
+        r"verification code to continue:\s*(\d{6})",
+        r"Subject:.*?(\d{6})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1)
+    fallback = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
+    return fallback.group(1) if fallback else ""
+
+
 def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
-    """使用 Mail.tm Token 轮询获取 OpenAI 验证码"""
-    url_list = f"{MAILTM_BASE}/messages"
+    """使用 Mail.tm Token 轮询获取  验证码"""
+    url_list = f"{MAILTM_BASE}/api/emails"
+    params = {"mailbox": email}
+    
     regex = r"(?<!\d)(\d{6})(?!\d)"
     seen_ids: set[str] = set()
 
@@ -183,7 +243,7 @@ def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
                 url_list,
                 headers=_mailtm_headers(token=token),
                 proxies=proxies,
-                impersonate="chrome",
+                params=params,
                 timeout=15,
             )
             if resp.status_code != 200:
@@ -191,39 +251,16 @@ def get_oai_code(token: str, email: str, proxies: Any = None) -> str:
                 continue
 
             data = resp.json()
-            if isinstance(data, list):
-                messages = data
-            elif isinstance(data, dict):
-                messages = data.get("hydra:member") or data.get("messages") or []
-            else:
-                messages = []
 
-            for msg in messages:
+            for msg in data:
                 if not isinstance(msg, dict):
                     continue
-                msg_id = str(msg.get("id") or "").strip()
-                if not msg_id or msg_id in seen_ids:
-                    continue
-                seen_ids.add(msg_id)
-
-                read_resp = requests.get(
-                    f"{MAILTM_BASE}/messages/{msg_id}",
-                    headers=_mailtm_headers(token=token),
-                    proxies=proxies,
-                    impersonate="chrome",
-                    timeout=15,
-                )
-                if read_resp.status_code != 200:
-                    continue
-
-                mail_data = read_resp.json()
-                sender = str(
-                    ((mail_data.get("from") or {}).get("address") or "")
-                ).lower()
-                subject = str(mail_data.get("subject") or "")
-                intro = str(mail_data.get("intro") or "")
-                text = str(mail_data.get("text") or "")
-                html = mail_data.get("html") or ""
+                
+                sender = str(msg.get("sender") or "").lower()
+                subject = str(msg.get("subject") or "")
+                intro = str(msg.get("preview") or "")
+                text = str(msg.get("preview") or "")
+                html = msg.get("preview") or ""
                 if isinstance(html, list):
                     html = "\n".join(str(x) for x in html)
                 content = "\n".join([subject, intro, text, str(html)])
@@ -359,7 +396,10 @@ def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, A
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        context = None
+        if not _ssl_verify():
+            context = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             raw = resp.read()
             if resp.status != 200:
                 raise RuntimeError(
@@ -371,6 +411,47 @@ def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, A
         raise RuntimeError(
             f"token exchange failed: {exc.code}: {raw.decode('utf-8', 'replace')}"
         ) from exc
+
+
+def _post_with_retry(
+    session: requests.Session,
+    url: str,
+    *,
+    headers: Dict[str, Any],
+    data: Any = None,
+    json_body: Any = None,
+    proxies: Any = None,
+    timeout: int = 30,
+    retries: int = 2,
+) -> Any:
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            if json_body is not None:
+                return session.post(
+                    url,
+                    headers=headers,
+                    json=json_body,
+                    proxies=proxies,
+                    verify=_ssl_verify(),
+                    timeout=timeout,
+                )
+            return session.post(
+                url,
+                headers=headers,
+                data=data,
+                proxies=proxies,
+                verify=_ssl_verify(),
+                timeout=timeout,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt >= retries:
+                break
+            time.sleep(2 * (attempt + 1))
+    if last_error:
+        raise last_error
+    raise RuntimeError("Request failed without exception")
 
 
 @dataclass(frozen=True)
@@ -473,36 +554,62 @@ def submit_callback_url(
 # 核心注册逻辑
 # ==========================================
 
-def run(proxy: Optional[str]) -> Optional[str]:
+
+def _generate_password(length: int = 16) -> str:
+    """生成符合 OpenAI 要求的随机强密码（大小写+数字+特殊字符）"""
+    upper = random.choices(string.ascii_uppercase, k=2)
+    lower = random.choices(string.ascii_lowercase, k=2)
+    digits = random.choices(string.digits, k=2)
+    specials = random.choices("!@#$%&*", k=2)
+    rest_len = length - 8
+    pool = string.ascii_letters + string.digits + "!@#$%&*"
+    rest = random.choices(pool, k=rest_len)
+    chars = upper + lower + digits + specials + rest
+    random.shuffle(chars)
+    return "".join(chars)
+
+
+def run(proxy: Optional[str]) -> tuple:
     proxies: Any = None
     if proxy:
         proxies = {"http": proxy, "https": proxy}
 
-    s = requests.Session(proxies=proxies, impersonate="chrome")
+    impersonate_target = random.choice(["chrome110", "chrome120", "edge99", "edge101", "safari15_3", "safari15_5", "safari", "chrome", "edge"])
+    s = requests.Session(proxies=proxies, impersonate=impersonate_target)
 
-    try:
-        trace = s.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
-        trace = trace.text
-        loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
-        loc = loc_re.group(1) if loc_re else None
-        print(f"[*] 当前 IP 所在地: {loc}")
-        if loc == "CN" or loc == "HK":
-            raise RuntimeError("检查代理哦w - 所在地不支持")
-    except Exception as e:
-        print(f"[Error] 网络连接检查失败: {e}")
-        return None
+    if not _skip_net_check():
+        try:
+            trace = s.get(
+                "https://cloudflare.com/cdn-cgi/trace",
+                proxies=proxies,
+                verify=_ssl_verify(),
+                timeout=10,
+            )
+            trace = trace.text
+            loc_re = re.search(r"^loc=(.+)$", trace, re.MULTILINE)
+            loc = loc_re.group(1) if loc_re else None
+            print(f"[*] 当前 IP 所在地: {loc}")
+            # if loc == "CN" or loc == "HK":
+            #     raise RuntimeError("检查代理哦w - 所在地不支持")
+        except Exception as e:
+            print(f"[Error] 网络连接检查失败: {e}")
+            return None, None
 
     email, dev_token = get_email_and_token(proxies)
     if not email or not dev_token:
-        return None
-    print(f"[*] 成功获取 Mail.tm 邮箱与授权: {email}")
+        return None, None
+    print(f"[*] 成功获取临时邮箱与授权: {email}")
+    masked = dev_token[:8] + "..." if dev_token else ""
+    print(f"[*] 临时邮箱 JWT: {masked}")
 
     oauth = generate_oauth_url()
     url = oauth.auth_url
 
     try:
-        resp = s.get(url, timeout=15)
-        did = s.cookies.get("oai-did")
+        resp = s.get(url, proxies=proxies, verify=True, timeout=15)
+        # Randomize 'did' parameter instead of parsing from cookies
+        did = str(uuid.uuid4())
+        s.cookies.set("oai-did", did, domain=".openai.com")
         print(f"[*] Device ID: {did}")
 
         signup_body = f'{{"username":{{"value":"{email}","kind":"email"}},"screen_hint":"signup"}}'
@@ -517,13 +624,14 @@ def run(proxy: Optional[str]) -> Optional[str]:
             },
             data=sen_req_body,
             proxies=proxies,
-            impersonate="chrome",
+            impersonate=impersonate_target,
+            verify=_ssl_verify(),
             timeout=15,
         )
 
         if sen_resp.status_code != 200:
             print(f"[Error] Sentinel 异常拦截，状态码: {sen_resp.status_code}")
-            return None
+            return None, None
 
         sen_token = sen_resp.json()["token"]
         sentinel = f'{{"p": "", "t": "", "c": "{sen_token}", "id": "{did}", "flow": "authorize_continue"}}'
@@ -537,37 +645,120 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "openai-sentinel-token": sentinel,
             },
             data=signup_body,
+            proxies=proxies,
+            verify=_ssl_verify(),
         )
-        print(f"[*] 提交注册表单状态: {signup_resp.status_code}")
+        signup_status = signup_resp.status_code
+        print(f"[*] 提交注册表单状态: {signup_status}")
 
-        otp_resp = s.post(
-            "https://auth.openai.com/api/accounts/passwordless/send-otp",
+        if signup_status == 403:
+            print("[Error] 提交注册表单返回 403，中断本次运行，将在10秒后重试...")
+            return "retry_403", None
+        if signup_status != 200:
+            print("[Error] 提交注册表单失败，跳过本次流程")
+            print(signup_resp.text)
+            return None, None
+
+        # --- 密码注册流程（/user/register 接口）---
+        password = _generate_password()
+        register_body = json.dumps({"password": password, "username": email})
+        print(f"[*] 生成随机密码: {password[:4]}****")
+
+        pwd_resp = s.post(
+            "https://auth.openai.com/api/accounts/user/register",
             headers={
                 "referer": "https://auth.openai.com/create-account/password",
                 "accept": "application/json",
                 "content-type": "application/json",
+                "openai-sentinel-token": sentinel,
             },
+            data=register_body,
+            proxies=proxies,
+            verify=_ssl_verify(),
         )
-        print(f"[*] 验证码发送状态: {otp_resp.status_code}")
+        print(f"[*] 提交注册(密码)状态: {pwd_resp.status_code}")
+        if pwd_resp.status_code != 200:
+            print(pwd_resp.text)
+            return None, None
 
-        code = get_oai_code(dev_token, email, proxies)
-        if not code:
-            return None
+        # 解析 /user/register 的响应，获取 continue_url
+        try:
+            register_json = pwd_resp.json()
+            register_continue = register_json.get("continue_url", "")
+            register_page = (register_json.get("page") or {}).get("type", "")
+            print(f"[*] 注册响应 continue_url: {register_continue}")
+            print(f"[*] 注册响应 page.type: {register_page}")
+        except Exception:
+            register_continue = ""
+            register_page = ""
+            print(f"[*] 注册响应(raw): {pwd_resp.text[:300]}")
 
-        code_body = f'{{"code":"{code}"}}'
-        code_resp = s.post(
-            "https://auth.openai.com/api/accounts/email-otp/validate",
-            headers={
-                "referer": "https://auth.openai.com/email-verification",
-                "accept": "application/json",
-                "content-type": "application/json",
-            },
-            data=code_body,
-        )
-        print(f"[*] 验证码校验状态: {code_resp.status_code}")
+        # 根据 continue_url 判断是否需要邮箱验证
+        need_otp = "email-verification" in register_continue or "verify" in register_continue
+        if not need_otp and register_page:
+            need_otp = "verification" in register_page or "otp" in register_page
 
-        create_account_body = '{"name":"Neo","birthdate":"2000-02-20"}'
-        create_account_resp = s.post(
+        if need_otp:
+            print("[*] 需要邮箱验证，开始等待验证码...")
+
+            # 先触发 OpenAI 发送 OTP
+            if register_continue:
+                otp_send_url = register_continue
+                if not otp_send_url.startswith("http"):
+                    otp_send_url = f"https://auth.openai.com{otp_send_url}"
+                print(f"[*] 触发发送 OTP: {otp_send_url}")
+                otp_send_resp = _post_with_retry(
+                    s,
+                    otp_send_url,
+                    headers={
+                        "referer": "https://auth.openai.com/create-account/password",
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                        "openai-sentinel-token": sentinel,
+                    },
+                    json_body={},
+                    proxies=proxies,
+                    timeout=30,
+                    retries=2,
+                )
+                print(f"[*] OTP 发送状态: {otp_send_resp.status_code}")
+                if otp_send_resp.status_code != 200:
+                    print(otp_send_resp.text)
+
+            
+            code = get_oai_code(dev_token, email, proxies)
+            if not code:
+                print("[Error] 未输入验证码，跳过")
+                return None, None
+
+            print("[*] 开始校验验证码...")
+            code_resp = _post_with_retry(
+                s,
+                "https://auth.openai.com/api/accounts/email-otp/validate",
+                headers={
+                    "referer": "https://auth.openai.com/email-verification",
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "openai-sentinel-token": sentinel,
+                },
+                json_body={"code": code},
+                proxies=proxies,
+                timeout=30,
+                retries=2,
+            )
+            print(f"[*] 验证码校验状态: {code_resp.status_code}")
+            if code_resp.status_code != 200:
+                print(code_resp.text)
+        else:
+            print("[*] 密码注册无需邮箱验证，跳过 OTP 步骤")
+
+        fake = Faker()
+        random_name = fake.first_name()
+        random_birthdate = fake.date_of_birth(minimum_age=18, maximum_age=60).strftime("%Y-%m-%d")
+        create_account_body = json.dumps({"name": random_name, "birthdate": random_birthdate})
+        print("[*] 开始创建账户...")
+        create_account_resp = _post_with_retry(
+            s,
             "https://auth.openai.com/api/accounts/create_account",
             headers={
                 "referer": "https://auth.openai.com/about-you",
@@ -575,52 +766,66 @@ def run(proxy: Optional[str]) -> Optional[str]:
                 "content-type": "application/json",
             },
             data=create_account_body,
+            proxies=proxies,
+            timeout=30,
+            retries=2,
         )
         create_account_status = create_account_resp.status_code
         print(f"[*] 账户创建状态: {create_account_status}")
 
         if create_account_status != 200:
             print(create_account_resp.text)
-            return None
+            return None, None
 
         auth_cookie = s.cookies.get("oai-client-auth-session")
         if not auth_cookie:
             print("[Error] 未能获取到授权 Cookie")
-            return None
+            return None, None
 
         auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
         workspaces = auth_json.get("workspaces") or []
         if not workspaces:
             print("[Error] 授权 Cookie 里没有 workspace 信息")
-            return None
+            return None, None
         workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
         if not workspace_id:
             print("[Error] 无法解析 workspace_id")
-            return None
+            return None, None
 
         select_body = f'{{"workspace_id":"{workspace_id}"}}'
-        select_resp = s.post(
+        print("[*] 开始选择 workspace...")
+        select_resp = _post_with_retry(
+            s,
             "https://auth.openai.com/api/accounts/workspace/select",
             headers={
                 "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
                 "content-type": "application/json",
             },
             data=select_body,
+            proxies=proxies,
+            timeout=30,
+            retries=2,
         )
 
         if select_resp.status_code != 200:
             print(f"[Error] 选择 workspace 失败，状态码: {select_resp.status_code}")
             print(select_resp.text)
-            return None
+            return None, None
 
         continue_url = str((select_resp.json() or {}).get("continue_url") or "").strip()
         if not continue_url:
             print("[Error] workspace/select 响应里缺少 continue_url")
-            return None
+            return None, None
 
         current_url = continue_url
         for _ in range(6):
-            final_resp = s.get(current_url, allow_redirects=False, timeout=15)
+            final_resp = s.get(
+                current_url,
+                allow_redirects=False,
+                proxies=proxies,
+                verify=_ssl_verify(),
+                timeout=15,
+            )
             location = final_resp.headers.get("Location") or ""
 
             if final_resp.status_code not in [301, 302, 303, 307, 308]:
@@ -630,126 +835,100 @@ def run(proxy: Optional[str]) -> Optional[str]:
 
             next_url = urllib.parse.urljoin(current_url, location)
             if "code=" in next_url and "state=" in next_url:
-                return submit_callback_url(
+                token_json = submit_callback_url(
                     callback_url=next_url,
                     code_verifier=oauth.code_verifier,
                     redirect_uri=oauth.redirect_uri,
                     expected_state=oauth.state,
                 )
+                return token_json, password
             current_url = next_url
 
         print("[Error] 未能在重定向链中捕获到最终 Callback URL")
-        return None
+        return None, None
 
     except Exception as e:
         print(f"[Error] 运行时发生错误: {e}")
-        return None
+        return None, None
 
-# 用来控制后台任务是否运行
-running = False
-worker_thread = None
 
-@app.route("/stop")
-def stop_task():
-    global running
-    running = False
-    return ({"msg": "后台任务已停止"})
-
-@app.route("/s")
-def start_task():
-    global running, worker_thread
-
-    if running:
-        return ({"msg": "任务已经在运行中"})
-
-    running = True
-    worker_thread = threading.Thread(target=main, daemon=True)
-    worker_thread.start()
-
-    return ({"msg": "后台任务已启动"})
-
-def get_env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "y", "on")
-
-def get_env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        print(f"[Warn] 环境变量 {name} 不是合法整数，使用默认值 {default}")
-        return default
-    
 def main() -> None:
-    try:
-        global running
+    parser = argparse.ArgumentParser(description="OpenAI 自动注册脚本")
+    parser.add_argument(
+        "--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890"
+    )
+    parser.add_argument("--once", action="store_true", help="只运行一次")
+    parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
+    parser.add_argument(
+        "--sleep-max", type=int, default=30, help="循环模式最长等待秒数"
+    )
+    args = parser.parse_args()
 
-        print("Hello, world!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    sleep_min = 600
+    sleep_max = 1000
 
-        # 从环境变量读取配置
-        proxy = os.environ.get("PROXY", None)
-        once = get_env_bool("ONCE", False)
-        sleep_min = max(1, get_env_int("SLEEP_MIN", 300))
-        sleep_max = max(sleep_min, get_env_int("SLEEP_MAX", 500))
+    count = 0
+    print("[Info] Yasal's Seamless OpenAI Auto-Registrar Started for ZJH")
+    print()
+    print("=" * 60)
+    print("  🔥 本脚本由 gaojilingjuli 出品")
+    print("=" * 60)
+    print()
 
-        count = 0
-        print("[Info] Yasal's Seamless AI Auto-Registrar Started for ZJH")
-        print(f"[Info] PROXY={proxy}")
-        print(f"[Info] ONCE={once}")
-        print(f"[Info] SLEEP_MIN={sleep_min}")
-        print(f"[Info] SLEEP_MAX={sleep_max}")
+    while True:
+        count += 1
+        print(
+            f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<"
+        )
 
-        # 确保 json 目录存在
-        os.makedirs("json", exist_ok=True)
+        try:
+            token_json, password = run(args.proxy)
 
-        while True:
-            count += 1
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<")
+            if token_json == "retry_403":
+                print("[Info] 检测到 403 错误，等待10秒后重试...")
+                time.sleep(10)
+                continue
 
-            try:
-                token_json = run(proxy)
+            if token_json:
+                try:
+                    t_data = json.loads(token_json)
+                    fname_email = t_data.get("email", "unknown").replace("@", "_")
+                    account_email = t_data.get("email", "")
+                except Exception:
+                    fname_email = "unknown"
+                    account_email = ""
 
-                if token_json:
-                    try:
-                        t_data = json.loads(token_json)
-                        fname_email = t_data.get("email", "unknown").replace("@", "_")
-                    except Exception:
-                        fname_email = "unknown"
+                file_name = f"token_{fname_email}_{int(time.time())}.json"
+                if TOKEN_OUTPUT_DIR:
+                    os.makedirs(TOKEN_OUTPUT_DIR, exist_ok=True)
+                    file_name = os.path.join(TOKEN_OUTPUT_DIR, file_name)
 
-                    file_name = f"token_{fname_email}_{int(time.time())}.json"
-                    file_path = os.path.join("json", file_name)
+                file_path = os.path.join("json", file_name)
 
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(token_json)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(token_json)
 
-                    print(f"[*] 成功! Token 已保存至: {file_name}")
-                else:
-                    print("[-] 本次注册失败。")
+                print(f"[*] 成功! Token 已保存至: {file_name}")
 
-            except Exception as e:
-                print(f"[Error] 发生未捕获异常: {e}")
+                # 追加记录账号密码
+                if account_email and password:
+                    accounts_file = os.path.join(TOKEN_OUTPUT_DIR, "accounts.txt") if TOKEN_OUTPUT_DIR else "accounts.txt"
+                    with open(accounts_file, "a", encoding="utf-8") as af:
+                        af.write(f"{account_email}----{password}\n")
+                    print(f"[*] 账号密码已追加至: {accounts_file}")
+            else:
+                print("[-] 本次注册失败。")
 
-            if running is False:
-                print("[Info] running=False，程序退出。")
-                break
+        except Exception as e:
+            print(f"[Error] 发生未捕获异常: {e}")
 
-            if once:
-                print("[Info] ONCE=true，只运行一次，程序退出。")
-                break
+        if args.once:
+            break
 
-            wait_time = random.randint(sleep_min, sleep_max)
-            print(f"[*] 休息 {wait_time} 秒...")
-            time.sleep(wait_time)
+        wait_time = random.randint(sleep_min, sleep_max)
+        print(f"[*] 休息 {wait_time} 秒...")
+        time.sleep(wait_time)
 
-        return None
-
-    except Exception as e:
-        print(f"[Error] main() 发生未捕获异常: {e}")
-        return None
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))  # 本地调试用默认端口
